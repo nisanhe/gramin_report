@@ -232,7 +232,7 @@ def send_performance_report_v5(comparison_data):
 
 # --- הרצה ראשית ---
 if __name__ == "__main__":
-    df = get_garmin_data()
+    df = get_garmin_client()
     if df is not None:
         comp_data = get_weekly_comparison_v2(df)
         send_performance_report_v5(comp_data)
