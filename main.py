@@ -12,49 +12,76 @@ CSV_PATH = 'data/garmin_runs.csv'
 START_DATE = "2026-01-01"
 TODAY = datetime.now()
 
-def get_garmin_data():
-    """מושך נתונים חדשים מגרמין ומאחד עם הקובץ הקיים ב-Repo"""
+def get_garmin_client():
+    """Handles authentication using session tokens to avoid 429 errors"""
+    email = os.environ.get('GARMIN_EMAIL')
+    password = os.environ.get('GARMIN_PASS')
+    
+    os.makedirs('data', exist_ok=True)
+    client = Garmin(email, password)
+    
+    # 1. Try to load existing session
+    if os.path.exists(TOKEN_PATH):
+        try:
+            print("🔑 Found existing token, attempting to restore session...")
+            with open(TOKEN_PATH, 'r') as f:
+                token_data = json.load(f)
+            client.login(token_data)
+            print("✅ Session restored.")
+            return client
+        except Exception as e:
+            print(f"⚠️ Session expired: {e}. Logging in fresh...")
+
+    # 2. Fresh login if no token or expired
+    print("🔗 Performing fresh login (this is high-risk for Rate Limiting)...")
+    client.login()
+    
+    # 3. Save token for next time
+    with open(TOKEN_PATH, 'w') as f:
+        json.dump(client.session_data, f)
+    print("💾 Token saved to disk.")
+    return client
+
+def sync_data():
+    """Main data sync logic"""
     try:
-        # 1. בדיקה אם קיים דאטה קודם ב-Repo
+        # Load existing data from Repo
         if os.path.exists(CSV_PATH):
-            print("📁 Loading existing data...")
+            print("📁 Loading existing CSV...")
             df_existing = pd.read_csv(CSV_PATH)
             df_existing['date'] = pd.to_datetime(df_existing['date'])
             last_date = df_existing['date'].max().date()
             fetch_start = (last_date + timedelta(days=1)).isoformat()
         else:
-            print("🆕 No existing data found. Starting fresh...")
             df_existing = pd.DataFrame()
             fetch_start = START_DATE
 
-        # 2. התחברות (משיכת Secrets מתוך ה-Environment של ה-Action)
-        print("🔗 Connecting to Garmin...")
-        client = Garmin(os.environ.get('GARMIN_EMAIL'), os.environ.get('GARMIN_PASS'))
-        client.login()
-
-        # 3. שליפת פעילויות
-        print(f"⏳ Fetching activities from {fetch_start}...")
+        # Get Client
+        client = get_garmin_client()
+        
+        # Fetch Activities
+        print(f"⏳ Fetching activities since {fetch_start}...")
         activities = client.get_activities_by_date(fetch_start, TODAY.date().isoformat())
         
         if not activities:
-            print("☕ No new activities to fetch.")
+            print("☕ No new activities found.")
             return df_existing
 
-        all_rows = []
+        new_rows = []
         for act in activities:
             dist_m = act.get('distance', 0)
             duration_sec = act.get('duration', 0)
             dist_km = round(dist_m / 1000, 2)
             duration_min = round(duration_sec / 60, 2)
-
-            # חישוב אורך צעד אם חסר
+            
+            # Stride Calculation
             stride_cm = act.get('avgStrideLength', 0)
             cadence = act.get('avgCadence', 0)
             if (not stride_cm or stride_cm == 0) and cadence > 0 and duration_min > 0:
                 total_steps = cadence * duration_min
                 stride_cm = (dist_km * 100000) / total_steps if total_steps > 0 else 0
 
-            row = {
+            new_rows.append({
                 'activity_id': act.get('activityId'),
                 'date': act.get('startTimeLocal'),
                 'type': act.get('activityType', {}).get('typeKey'),
@@ -66,35 +93,28 @@ def get_garmin_data():
                 'cadence': round(cadence, 1),
                 'stride_length_cm': round(stride_cm, 1),
                 'elevation_gain': act.get('elevationGain', 0),
-                'aerobic_te': act.get('aerobicTrainingEffect', 0),
-                'anaerobic_te': act.get('anaerobicTrainingEffect', 0),
-                'calories': act.get('calories', 0)
-            }
-            all_rows.append(row)
+                'acwr': 0 # Placeholder
+            })
 
-        # 4. איחוד ועיבוד
-        new_df = pd.DataFrame(all_rows)
+        new_df = pd.DataFrame(new_rows)
         new_df['date'] = pd.to_datetime(new_df['date'])
         
+        # Merge and Recalculate ACWR
         full_df = pd.concat([df_existing, new_df]).drop_duplicates(subset=['activity_id'])
         full_df = full_df.sort_values('date').reset_index(drop=True)
-
-        # 5. חישוב מדדי עומס (Workload & ACWR)
-        print("📈 Calculating training metrics...")
+        
+        print("📈 Calculating ACWR...")
         full_df['workload'] = full_df['distance_km'] * (full_df['avg_hr'] / 100)
         full_df['acute'] = full_df['workload'].rolling(window=7, min_periods=1).mean()
         full_df['chronic'] = full_df['workload'].rolling(window=28, min_periods=1).mean()
         full_df['acwr'] = (full_df['acute'] / full_df['chronic']).replace([np.inf, -np.inf], 0).fillna(0)
 
-        # 6. שמירה מקומית (ה-Action יעלה את זה חזרה ל-Repo)
-        os.makedirs('data', exist_ok=True)
         full_df.to_csv(CSV_PATH, index=False)
         return full_df
 
     except Exception as e:
-        print(f"❌ Error in get_garmin_data: {e}")
+        print(f"❌ Error in sync: {e}")
         return None
-
 def get_weekly_comparison_v2(df):
     today_date = TODAY.date()
     periods = [
