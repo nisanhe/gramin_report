@@ -14,6 +14,7 @@ import numpy as np
 from datetime import datetime
 from garminconnect import Garmin
 from google.colab import userdata
+import os
 
 # --- הגדרות ---
 NEW_CSV_PATH = '/content/drive/MyDrive/Garmin_Project/garmin_master_2026_rebuilt.csv'
@@ -23,7 +24,7 @@ def rebuild_2026_dataset():
     try:
         # 1. התחברות לגרמין
         print("🔗 Connecting to Garmin...")
-        client = Garmin(userdata.get('garmin_email'), userdata.get('garmin_pass'))
+        client = Garmin(os.environ.get('garmin_email'), os.environ.get('garmin_pass'))
         client.login()
 
         # 2. שליפת כל הפעילויות מ-2026
@@ -137,9 +138,9 @@ def get_weekly_comparison_v2(df):
 """# Send email"""
 
 def send_performance_report_v5(comparison_data):
-    SENDER = userdata.get('sender')
-    RECEIVER = userdata.get('RECEIVER_EMAIL')
-    PASSWORD = userdata.get('gramin_report')
+    SENDER = os.environ.get('sender')
+    RECEIVER = os.environ.get('receiver_email')
+    PASSWORD = os.environ.get('gramin_report')
 
     if not SENDER or not RECEIVER or not PASSWORD:
         print("❌ Credentials missing.")
