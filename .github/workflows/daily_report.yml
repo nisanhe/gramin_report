@@ -1,0 +1,32 @@
+name: Garmin Weekly Report
+
+on:
+  schedule:
+    - cron: '0 19 * * 5'
+  workflow_dispatch: # מאפשר להריץ ידנית לבדיקה
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install pandas numpy garminconnect
+
+      - name: Run Analytics Script
+        env:
+          # כאן אנחנו מחברים בין ה-Secrets של ה-Repo למשתני הסביבה של הסקריפט
+          GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
+          GARMIN_PASS: ${{ secrets.GARMIN_PASS }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python main.py
