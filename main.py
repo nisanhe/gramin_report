@@ -1,70 +1,80 @@
 import pandas as pd
 import numpy as np
 import os
+import json
 import smtplib
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from garminconnect import Garmin
 
-# --- הגדרות נתיבים וסביבה ---
+# --- Configuration & Paths ---
 CSV_PATH = 'data/garmin_runs.csv'
+TOKEN_PATH = 'data/garmin_token.json'
 START_DATE = "2026-01-01"
 TODAY = datetime.now()
 
 def get_garmin_client():
-    """Handles authentication using session tokens to avoid 429 errors"""
+    """
+    Handles authentication using session tokens to avoid 429 (Rate Limit) errors.
+    If a token exists, it attempts to restore the session. Otherwise, it performs a fresh login.
+    """
     email = os.environ.get('GARMIN_EMAIL')
     password = os.environ.get('GARMIN_PASS')
     
+    # Ensure data directory exists for token storage
     os.makedirs('data', exist_ok=True)
     client = Garmin(email, password)
     
-    # 1. Try to load existing session
+    # 1. Try to load existing session from disk
     if os.path.exists(TOKEN_PATH):
         try:
             print("🔑 Found existing token, attempting to restore session...")
             with open(TOKEN_PATH, 'r') as f:
                 token_data = json.load(f)
             client.login(token_data)
-            print("✅ Session restored.")
+            print("✅ Session restored successfully.")
             return client
         except Exception as e:
-            print(f"⚠️ Session expired: {e}. Logging in fresh...")
+            print(f"⚠️ Session expired or invalid: {e}. Proceeding to fresh login...")
 
-    # 2. Fresh login if no token or expired
-    print("🔗 Performing fresh login (this is high-risk for Rate Limiting)...")
+    # 2. Fresh login (High risk of 429 if called too frequently)
+    print("🔗 Performing fresh login...")
     client.login()
     
-    # 3. Save token for next time
+    # 3. Save the new session token for future runs
     with open(TOKEN_PATH, 'w') as f:
         json.dump(client.session_data, f)
-    print("💾 Token saved to disk.")
+    print("💾 Token saved to disk for next session.")
     return client
 
 def sync_data():
-    """Main data sync logic"""
+    """
+    Synchronizes Garmin activities with the local CSV file.
+    Calculates ACWR (Acute:Chronic Workload Ratio) for injury prevention monitoring.
+    """
     try:
-        # Load existing data from Repo
+        # Load existing database
         if os.path.exists(CSV_PATH):
-            print("📁 Loading existing CSV...")
+            print("📁 Loading existing database...")
             df_existing = pd.read_csv(CSV_PATH)
             df_existing['date'] = pd.to_datetime(df_existing['date'])
             last_date = df_existing['date'].max().date()
             fetch_start = (last_date + timedelta(days=1)).isoformat()
         else:
+            print("🆕 No existing database found. Starting fresh.")
             df_existing = pd.DataFrame()
             fetch_start = START_DATE
 
-        # Get Client
+        # Initialize Garmin Client
         client = get_garmin_client()
         
-        # Fetch Activities
-        print(f"⏳ Fetching activities since {fetch_start}...")
+        # Fetch new activities
+        print(f"⏳ Fetching activities from {fetch_start} to today...")
         activities = client.get_activities_by_date(fetch_start, TODAY.date().isoformat())
         
         if not activities:
-            print("☕ No new activities found.")
+            print("☕ No new activities found in Garmin Connect.")
             return df_existing
 
         new_rows = []
@@ -74,7 +84,7 @@ def sync_data():
             dist_km = round(dist_m / 1000, 2)
             duration_min = round(duration_sec / 60, 2)
             
-            # Stride Calculation
+            # Stride Calculation Logic
             stride_cm = act.get('avgStrideLength', 0)
             cadence = act.get('avgCadence', 0)
             if (not stride_cm or stride_cm == 0) and cadence > 0 and duration_min > 0:
@@ -93,29 +103,34 @@ def sync_data():
                 'cadence': round(cadence, 1),
                 'stride_length_cm': round(stride_cm, 1),
                 'elevation_gain': act.get('elevationGain', 0),
-                'acwr': 0 # Placeholder
             })
 
         new_df = pd.DataFrame(new_rows)
         new_df['date'] = pd.to_datetime(new_df['date'])
         
-        # Merge and Recalculate ACWR
+        # Merge datasets and remove duplicates
         full_df = pd.concat([df_existing, new_df]).drop_duplicates(subset=['activity_id'])
         full_df = full_df.sort_values('date').reset_index(drop=True)
         
-        print("📈 Calculating ACWR...")
+        # Calculate Training Load (ACWR)
+        print("📈 Recalculating training load metrics...")
         full_df['workload'] = full_df['distance_km'] * (full_df['avg_hr'] / 100)
         full_df['acute'] = full_df['workload'].rolling(window=7, min_periods=1).mean()
         full_df['chronic'] = full_df['workload'].rolling(window=28, min_periods=1).mean()
         full_df['acwr'] = (full_df['acute'] / full_df['chronic']).replace([np.inf, -np.inf], 0).fillna(0)
 
+        # Save to CSV (This will be committed by GitHub Actions)
         full_df.to_csv(CSV_PATH, index=False)
         return full_df
 
     except Exception as e:
-        print(f"❌ Error in sync: {e}")
+        print(f"❌ Error during sync: {e}")
         return None
+
 def get_weekly_comparison_v2(df):
+    """
+    Generates a comparative summary of the last 3 weeks.
+    """
     today_date = TODAY.date()
     periods = [
         (today_date - timedelta(days=6), today_date, "This Week"),
@@ -149,16 +164,21 @@ def get_weekly_comparison_v2(df):
     return comparison_data
 
 def send_performance_report_v5(comparison_data):
+    """
+    Sends an HTML formatted report via SMTP.
+    Requires SENDER_EMAIL, RECEIVER_EMAIL, and GRAMIN_REPORT (App Password) environment variables.
+    """
     SENDER = os.environ.get('SENDER_EMAIL')
     RECEIVER = os.environ.get('RECEIVER_EMAIL')
     PASSWORD = os.environ.get('GRAMIN_REPORT')
 
     if not SENDER or not RECEIVER or not PASSWORD:
-        print("❌ Credentials missing.")
+        print("❌ Email credentials missing in environment variables.")
         return
 
     c = comparison_data
     acwr_val = c[0]['acwr']
+    # Color coding based on injury risk
     acwr_color = "#27ae60" if 0.8 <= acwr_val <= 1.3 else "#e67e22" if acwr_val < 0.8 else "#e74c3c"
 
     html_content = f"""
@@ -208,9 +228,9 @@ def send_performance_report_v5(comparison_data):
         <div style="margin-top: 25px; padding: 15px; background-color: #f0f7fd; border-left: 5px solid #3498db; border-radius: 8px;">
             <p style="margin: 0; font-size: 14px; color: #2c3e50;">
                 <b>🏃 Coach's Analysis:</b><br>
-                { "Caution: High workload. Focus on active recovery." if acwr_val > 1.3 
-                  else "Maintenance: Low load. Good time for a speed session." if acwr_val < 0.8 
-                  else "Optimal: Training load is perfectly balanced!" }
+                { "Caution: High workload detected. Prioritize recovery and sleep." if acwr_val > 1.3 
+                  else "Maintenance: Training load is low. Consider a tempo run." if acwr_val < 0.8 
+                  else "Optimal: Training load is perfectly balanced. Keep it up!" }
             </p>
         </div>
     </div>
@@ -226,13 +246,19 @@ def send_performance_report_v5(comparison_data):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(SENDER, PASSWORD)
             server.send_message(msg)
-        print("✅ Report sent successfully!")
+        print("✅ Performance report sent to inbox.")
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Failed to send email: {e}")
 
-# --- הרצה ראשית ---
+# --- Main Execution ---
 if __name__ == "__main__":
-    df = get_garmin_client()
-    if df is not None:
-        comp_data = get_weekly_comparison_v2(df)
-        send_performance_report_v5(comp_data)
+    # 1. Sync data and update CSV
+    final_df = sync_data()
+    
+    # 2. Proceed if sync was successful
+    if final_df is not None and not final_df.empty:
+        print("📊 Data synchronized. Analyzing weekly trends...")
+        weekly_stats = get_weekly_comparison_v2(final_df)
+        send_performance_report_v5(weekly_stats)
+    else:
+        print("⚠️ Execution stopped: No data available to report.")
